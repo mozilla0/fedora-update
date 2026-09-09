@@ -3,6 +3,8 @@
 Ein Sammel-Update-Script für Fedora KDE. Aktualisiert Systempakete, Flatpaks und
 Firmware in einem Durchgang und hält danach den Discover-Cache konsistent.
 
+<img width="1372" height="1365" alt="image" src="https://github.com/user-attachments/assets/20e5d686-ed4e-4a91-a4ed-5b76908d4238" />
+
 ## Warum
 
 Wer auf Fedora abwechselnd im Terminal (`dnf`, `flatpak`, `fwupdmgr`) und über
