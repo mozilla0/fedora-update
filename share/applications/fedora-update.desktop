@@ -1,0 +1,24 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Systemaktualisierung
+Name[en]=System Update
+GenericName=Fedora Sammel-Update
+Comment=Aktualisiert Systempakete, Flatpaks und Firmware in einem Durchgang
+Comment[en]=Updates system packages, flatpaks and firmware in one go
+Exec=env FEDORA_UPDATE_PAUSE=1 __BINPATH__
+Icon=system-software-update
+Terminal=true
+Categories=System;Settings;PackageManager;
+Keywords=Update;Aktualisierung;dnf;flatpak;firmware;fwupd;Paket;
+StartupNotify=true
+
+Actions=Unattended;DryRun;
+
+[Desktop Action Unattended]
+Name=Ohne Rückfragen aktualisieren
+Exec=env FEDORA_UPDATE_PAUSE=1 __BINPATH__ --yes
+
+[Desktop Action DryRun]
+Name=Testlauf (nur anzeigen)
+Exec=env FEDORA_UPDATE_PAUSE=1 __BINPATH__ --dry-run
