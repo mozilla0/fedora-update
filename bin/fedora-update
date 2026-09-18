@@ -6,29 +6,43 @@
 # und synchronisiert danach den Discover-Cache, damit der Update-Zähler
 # in Discover nicht auseinanderläuft.
 #
+# Ist die Systemfestplatte mit LUKS verschlüsselt und per systemd-cryptenroll
+# an das TPM gebunden (PCR 7), prüft das Script bei jedem Lauf, ob die
+# TPM-Entsperrung noch funktioniert, und richtet sie nach Firmware-Updates
+# auf Wunsch neu ein.
+#
 # Verwendung:
-#   fedora-update              interaktiv (fragt vor Firmware-Update nach)
-#   fedora-update --yes        vollautomatisch, keine Rückfragen
+#   fedora-update                interaktiv (fragt vor Firmware-Update nach)
+#   fedora-update --yes          vollautomatisch, keine Rückfragen
 #   fedora-update --no-firmware  Firmware-Updates überspringen
-#   fedora-update --dry-run    nur anzeigen, was zu tun wäre
+#   fedora-update --no-tpm       TPM-/LUKS-Prüfung überspringen
+#   fedora-update --tpm-check    nur TPM-Entsperrung prüfen und neu einrichten
+#   fedora-update --dry-run      nur anzeigen, was zu tun wäre
+#
+# Umgebungsvariable FEDORA_UPDATE_TPM_PCRS legt die PCRs für die
+# Neuanmeldung fest (Standard: 7).
 #
 
 set -uo pipefail
 
 # ---------------------------------------------------------------- Konstanten
 
-readonly VERSION="1.0.1"
+readonly VERSION="1.1.0"
 readonly LOGDIR="${XDG_STATE_HOME:-$HOME/.local/state}/fedora-update"
 LOGFILE="${LOGDIR}/$(date +%Y-%m-%d_%H%M%S).log"
 readonly LOGFILE
 readonly LOG_KEEP=20
+readonly TPM_PCRS="${FEDORA_UPDATE_TPM_PCRS:-7}"
 
 ASSUME_YES=0
 SKIP_FIRMWARE=0
 DRY_RUN=0
+SKIP_TPM=0
+TPM_ONLY=0
 REBOOT_NEEDED=0
 
 declare -a RESULTS=()
+declare -a TPM_DEVICES=()
 
 # ------------------------------------------------------------------ Ausgabe
 
@@ -76,8 +90,139 @@ ask() {
 	local answer
 	# Explizit vom Terminal lesen, damit die Abfrage auch funktioniert,
 	# wenn stdin umgeleitet ist. Ohne Terminal gilt die Antwort als Nein.
-	read -r -p "$(printf '%s?%s %s [j/N] ' "$C_YELLOW" "$C_RESET" "$prompt")" answer </dev/tty 2>/dev/null || return 1
+	{ : </dev/tty; } 2>/dev/null || return 1
+	read -r -p "$(printf '%s?%s %s [j/N] ' "$C_YELLOW" "$C_RESET" "$prompt")" answer </dev/tty || return 1
 	[[ "$answer" =~ ^([jJ]|[yY])$ ]]
+}
+
+# -------------------------------------------------------------- TPM / LUKS
+#
+# Hintergrund: systemd-cryptenroll versiegelt den LUKS-Schlüssel gegen
+# bestimmte PCR-Werte des TPM. PCR 7 bildet den Secure-Boot-Zustand ab
+# (Schlüssel, db/dbx). Spielt fwupd z. B. ein UEFI-dbx- oder BIOS-Update ein,
+# ändert sich PCR 7, das TPM gibt den Schlüssel nicht mehr frei und beim Start
+# wird die Passphrase verlangt. Die Daten sind dabei nie verloren, solange
+# noch ein Passwort- oder Recovery-Slot existiert – die TPM-Bindung muss nur
+# gegen die neuen PCR-Werte neu angelegt werden.
+
+# Hinweis: Ausgaben werden erst in Variablen gelesen und dann geprüft.
+# Ein direktes «befehl | grep -q» kann wegen pipefail zufällig fehlschlagen,
+# wenn grep früh beendet und der Befehl davor SIGPIPE erhält.
+
+# Findet alle LUKS-Geräte mit einem systemd-tpm2-Token.
+tpm_find_devices() {
+	TPM_DEVICES=()
+	local dev dump
+	while read -r dev; do
+		[[ -n "$dev" ]] || continue
+		dump=$(sudo -n cryptsetup luksDump "$dev" 2>/dev/null) || continue
+		if [[ "$dump" == *systemd-tpm2* ]]; then
+			TPM_DEVICES+=("$dev")
+		fi
+	done < <(lsblk -rpno NAME,FSTYPE 2>/dev/null | awk '$2 == "crypto_LUKS" { print $1 }')
+}
+
+# Ist die TPM-Bindung zusätzlich mit einer PIN geschützt?
+tpm_uses_pin() {
+	local dump
+	dump=$(sudo -n cryptsetup luksDump "$1" 2>/dev/null) || return 1
+	grep -Eq 'tpm2-pin:[[:space:]]*true' <<<"$dump"
+}
+
+# Prüft ohne Einhängen, ob das TPM das Gerät mit den aktuellen PCR-Werten
+# entsperren könnte.
+tpm_unlock_ok() {
+	sudo -n cryptsetup open --test-passphrase --token-only \
+		--token-type systemd-tpm2 "$1" </dev/null >/dev/null 2>&1
+}
+
+# Gibt es neben dem TPM noch eine Passphrase oder einen Recovery-Key?
+tpm_has_fallback() {
+	local slots
+	slots=$(sudo -n systemd-cryptenroll "$1" 2>/dev/null) || return 1
+	awk 'NR > 1 { print $2 }' <<<"$slots" | grep -Eqx 'password|recovery'
+}
+
+# Legt die TPM-Bindung gegen die aktuellen PCR-Werte neu an. Der alte
+# TPM-Slot wird erst nach erfolgreicher Neuanmeldung entfernt.
+tpm_reenroll() {
+	local dev="$1"
+	log "\$ sudo systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrs=$TPM_PCRS $dev"
+	info "Bitte Passphrase oder Wiederherstellungsschlüssel für $dev eingeben:"
+	# Die Eingabe soll bewusst vom Terminal kommen, nicht an sudo vorbei.
+	# shellcheck disable=SC2024
+	sudo systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto \
+		--tpm2-pcrs="$TPM_PCRS" "$dev" </dev/tty
+}
+
+tpm_step() {
+	section "$1"
+
+	if (( SKIP_TPM )); then
+		info "Auf Wunsch übersprungen (--no-tpm)"
+		RESULTS+=("tpm: übersprungen")
+		return 0
+	fi
+	if ! command -v cryptsetup >/dev/null 2>&1 || ! command -v systemd-cryptenroll >/dev/null 2>&1; then
+		info "cryptsetup/systemd-cryptenroll nicht vorhanden – nichts zu prüfen"
+		return 0
+	fi
+	if ! sudo -n true 2>/dev/null; then
+		info "Ohne sudo-Sitzung nicht prüfbar (Testlauf) – übersprungen"
+		RESULTS+=("tpm: nicht geprüft")
+		return 0
+	fi
+
+	tpm_find_devices
+	if (( ${#TPM_DEVICES[@]} == 0 )); then
+		info "Keine an das TPM gebundenen LUKS-Geräte gefunden"
+		return 0
+	fi
+
+	# Ohne das Token-Plugin kann cryptsetup die TPM-Entsperrung nicht testen
+	# und würde fälschlich einen Fehler melden.
+	if ! compgen -G '/usr/lib*/cryptsetup/libcryptsetup-token-systemd-tpm2.so' >/dev/null \
+		&& ! compgen -G '/usr/lib/*/cryptsetup/libcryptsetup-token-systemd-tpm2.so' >/dev/null; then
+		warn "cryptsetup-Plugin für systemd-tpm2 nicht gefunden – TPM-Entsperrung nicht prüfbar"
+		RESULTS+=("tpm: nicht geprüft")
+		return 0
+	fi
+
+	local dev failed=0
+	for dev in "${TPM_DEVICES[@]}"; do
+		if tpm_uses_pin "$dev"; then
+			info "$dev: TPM mit PIN – automatische Prüfung nicht möglich"
+			continue
+		fi
+		if tpm_unlock_ok "$dev"; then
+			ok "$dev: TPM-Entsperrung funktioniert"
+			continue
+		fi
+
+		warn "$dev: Das TPM gibt den Schlüssel nicht mehr frei (PCR-Werte geändert, z. B. nach einem Firmware-Update)."
+		if (( DRY_RUN )); then
+			info "[dry-run] sudo systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrs=$TPM_PCRS $dev"
+			failed=1
+			continue
+		fi
+		if ask "TPM-Bindung für $dev jetzt neu einrichten (PCR $TPM_PCRS)?"; then
+			if tpm_reenroll "$dev" && tpm_unlock_ok "$dev"; then
+				ok "$dev: TPM-Bindung neu eingerichtet"
+			else
+				fail "$dev: Neuanmeldung am TPM fehlgeschlagen"
+				failed=1
+			fi
+		else
+			info "Ausgelassen – beim Start wird weiterhin die Passphrase verlangt"
+			failed=1
+		fi
+	done
+
+	if (( failed )); then
+		RESULTS+=("tpm: Neuanmeldung ausstehend (fedora-update --tpm-check)")
+	else
+		RESULTS+=("tpm: OK")
+	fi
 }
 
 # --------------------------------------------------------------- Argumente
@@ -86,10 +231,12 @@ while (( $# )); do
 	case "$1" in
 		-y|--yes)         ASSUME_YES=1 ;;
 		--no-firmware)    SKIP_FIRMWARE=1 ;;
+		--no-tpm)         SKIP_TPM=1 ;;
+		--tpm-check)      TPM_ONLY=1 ;;
 		-n|--dry-run)     DRY_RUN=1 ;;
 		-V|--version)     printf 'fedora-update %s\n' "$VERSION"; exit 0 ;;
 		-h|--help)
-			sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'
+			sed -n '3,/^$/p' "$0" | sed 's/^# \{0,1\}//'
 			exit 0
 			;;
 		*)
@@ -99,6 +246,37 @@ while (( $# )); do
 	esac
 	shift
 done
+
+# ------------------------------------------------------------ Zusammenfassung
+
+finish() {
+	section "Zusammenfassung"
+
+	for line in "${RESULTS[@]}"; do
+		printf '  • %s\n' "$line"
+		log "  • $line"
+	done
+
+	printf '\n%s  Protokoll: %s%s\n' "$C_DIM" "$LOGFILE" "$C_RESET"
+
+	if (( REBOOT_NEEDED )); then
+		printf '\n%s%s  ⟳ Ein Neustart ist erforderlich.%s\n' "$C_BOLD" "$C_YELLOW" "$C_RESET"
+	fi
+
+	# Alte Protokolle aufräumen
+	if [[ -d "$LOGDIR" ]]; then
+		find "$LOGDIR" -maxdepth 1 -name '*.log' -type f -printf '%T@ %p\n' 2>/dev/null \
+			| sort -rn | tail -n +$((LOG_KEEP + 1)) | cut -d' ' -f2- \
+			| xargs -r rm -f
+	fi
+
+	printf '\n'
+
+	# Beim Start aus dem Anwendungsmenü würde sich das Fenster sofort schliessen.
+	if [[ -t 0 ]] && [[ -n "${FEDORA_UPDATE_PAUSE:-}" ]]; then
+		read -r -p "Zum Schliessen Enter drücken ... " _
+	fi
+}
 
 # ------------------------------------------------------------ Vorbereitung
 
@@ -128,14 +306,25 @@ if ! (( DRY_RUN )); then
 		sudo -n true
 		sleep 50
 		kill -0 "$$" 2>/dev/null || exit
-	done &
+	done >/dev/null 2>&1 &
 	readonly SUDO_KEEPALIVE_PID=$!
 	trap 'kill "$SUDO_KEEPALIVE_PID" 2>/dev/null' EXIT
 fi
 
-# ------------------------------------------------------- 1. RPM-Pakete (dnf)
+# ------------------------------------------------- 1. TPM-Entsperrung (LUKS)
 
-section "1/4  Systempakete (dnf)"
+if (( TPM_ONLY )); then
+	SKIP_TPM=0
+	tpm_step "TPM-Entsperrung (LUKS)"
+	finish
+	exit 0
+fi
+
+tpm_step "1/5  TPM-Entsperrung (LUKS)"
+
+# ------------------------------------------------------- 2. RPM-Pakete (dnf)
+
+section "2/5  Systempakete (dnf)"
 
 if command -v dnf >/dev/null 2>&1; then
 	dnf_args=(upgrade --refresh)
@@ -162,9 +351,9 @@ else
 	RESULTS+=("dnf: n/v")
 fi
 
-# --------------------------------------------------------- 2. Flatpak-Apps
+# --------------------------------------------------------- 3. Flatpak-Apps
 
-section "2/4  Flatpak-Anwendungen"
+section "3/5  Flatpak-Anwendungen"
 
 if command -v flatpak >/dev/null 2>&1; then
 	# flatpak darf hier nie selbst nachfragen: Durch die Ausgabe über tee
@@ -212,9 +401,9 @@ else
 	RESULTS+=("flatpak: n/v")
 fi
 
-# ------------------------------------------------------------- 3. Firmware
+# ------------------------------------------------------------- 4. Firmware
 
-section "3/4  Firmware (fwupd)"
+section "4/5  Firmware (fwupd)"
 
 if (( SKIP_FIRMWARE )); then
 	info "Auf Wunsch übersprungen (--no-firmware)"
@@ -235,12 +424,34 @@ elif command -v fwupdmgr >/dev/null 2>&1; then
 			fi
 		fi
 
-		if ask "Firmware jetzt aktualisieren? (Neustart erforderlich)"; then
+		# Schutz für TPM-gebundene LUKS-Geräte: Ein Firmware-Update kann PCR 7
+		# verändern. Ohne Passphrase oder Recovery-Key als Rückfallebene wäre
+		# das System danach nicht mehr zu entsperren – dann gar nicht erst
+		# aktualisieren.
+		fw_allowed=1
+		for dev in "${TPM_DEVICES[@]}"; do
+			if ! tpm_has_fallback "$dev"; then
+				fail "$dev ist nur über das TPM entsperrbar – ein Firmware-Update könnte das System unzugänglich machen."
+				info "Zuerst einen Wiederherstellungsschlüssel anlegen und sicher aufbewahren:"
+				info "  sudo systemd-cryptenroll --recovery-key $dev"
+				fw_allowed=0
+			fi
+		done
+		if (( fw_allowed && ${#TPM_DEVICES[@]} )); then
+			warn "Die Festplatte ist an das TPM gebunden. Nach dem Neustart wird die LUKS-Passphrase unter Umständen einmalig abgefragt."
+			info "Danach «fedora-update --tpm-check» ausführen (oder einfach den nächsten Update-Lauf), um das TPM neu einzurichten."
+		fi
+
+		if (( ! fw_allowed )); then
+			info "Firmware-Update aus Sicherheitsgründen ausgelassen"
+			RESULTS+=("firmware: blockiert – kein LUKS-Passwort/Recovery-Key")
+		elif ask "Firmware jetzt aktualisieren? (Neustart erforderlich)"; then
 			fw_args=(update)
 			(( ASSUME_YES )) && fw_args+=(-y --no-reboot-check)
 			if run sudo fwupdmgr "${fw_args[@]}"; then
 				ok "Firmware eingespielt"
 				RESULTS+=("firmware: OK – Neustart nötig")
+				(( ${#TPM_DEVICES[@]} )) && RESULTS+=("tpm: nach Neustart «fedora-update --tpm-check» ausführen")
 				REBOOT_NEEDED=1
 			else
 				fail "Firmware-Update mit Fehler beendet"
@@ -259,9 +470,9 @@ else
 	RESULTS+=("firmware: n/v")
 fi
 
-# ------------------------------------------------- 4. Discover synchronisieren
+# ------------------------------------------------- 5. Discover synchronisieren
 
-section "4/4  Discover-Cache abgleichen"
+section "5/5  Discover-Cache abgleichen"
 
 # Discover führt einen eigenen Cache und bekommt Terminal-Updates nicht mit.
 # Ohne diesen Schritt zeigt der Notifier veraltete Update-Zahlen an und
@@ -289,31 +500,4 @@ else
 	info "Discover nicht installiert – nichts abzugleichen"
 fi
 
-# ------------------------------------------------------------ Zusammenfassung
-
-section "Zusammenfassung"
-
-for line in "${RESULTS[@]}"; do
-	printf '  • %s\n' "$line"
-	log "  • $line"
-done
-
-printf '\n%s  Protokoll: %s%s\n' "$C_DIM" "$LOGFILE" "$C_RESET"
-
-if (( REBOOT_NEEDED )); then
-	printf '\n%s%s  ⟳ Ein Neustart ist erforderlich.%s\n' "$C_BOLD" "$C_YELLOW" "$C_RESET"
-fi
-
-# Alte Protokolle aufräumen
-if [[ -d "$LOGDIR" ]]; then
-	find "$LOGDIR" -maxdepth 1 -name '*.log' -type f -printf '%T@ %p\n' 2>/dev/null \
-		| sort -rn | tail -n +$((LOG_KEEP + 1)) | cut -d' ' -f2- \
-		| xargs -r rm -f
-fi
-
-printf '\n'
-
-# Beim Start aus dem Anwendungsmenü würde sich das Fenster sofort schliessen.
-if [[ -t 0 ]] && [[ -n "${FEDORA_UPDATE_PAUSE:-}" ]]; then
-	read -r -p "Zum Schliessen Enter drücken ... " _
-fi
+finish
