@@ -13,7 +13,7 @@ Categories=System;Settings;PackageManager;
 Keywords=Update;Aktualisierung;dnf;flatpak;firmware;fwupd;Paket;
 StartupNotify=true
 
-Actions=Unattended;DryRun;
+Actions=Unattended;DryRun;TpmCheck;
 
 [Desktop Action Unattended]
 Name=Ohne Rückfragen aktualisieren
@@ -22,3 +22,7 @@ Exec=env FEDORA_UPDATE_PAUSE=1 __BINPATH__ --yes
 [Desktop Action DryRun]
 Name=Testlauf (nur anzeigen)
 Exec=env FEDORA_UPDATE_PAUSE=1 __BINPATH__ --dry-run
+
+[Desktop Action TpmCheck]
+Name=TPM-Entsperrung prüfen / neu einrichten
+Exec=env FEDORA_UPDATE_PAUSE=1 __BINPATH__ --tpm-check
