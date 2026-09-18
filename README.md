@@ -61,8 +61,10 @@ fedora-update --dry-run      # Testlauf, verändert nichts
 
 1. **Systempakete** – `sudo dnf upgrade --refresh`, im automatischen Modus
    zusätzlich `dnf autoremove`
-2. **Flatpaks** – `flatpak update`, auf Wunsch inklusive Entfernen ungenutzter
-   Runtimes (die belegen sonst über die Zeit mehrere Gigabyte)
+2. **Flatpaks** – zuerst werden anstehende Aktualisierungen angezeigt und
+   bestätigt, danach läuft `flatpak update -y --noninteractive`. Auf Wunsch
+   werden zusätzlich ungenutzte Runtimes entfernt (die belegen sonst über die
+   Zeit mehrere Gigabyte)
 3. **Firmware** – `fwupdmgr refresh` und `fwupdmgr update` mit eigener
    Rückfrage, samt Warnung wenn kein Netzteil angeschlossen ist
 4. **Discover** – Notifier beenden, Caches unter `~/.cache/discover`,
