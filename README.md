@@ -106,8 +106,13 @@ Das Script kümmert sich darum in drei Schritten:
   alte TPM-Slot wird erst nach erfolgreicher Neuanmeldung entfernt.
 
 Andere PCRs lassen sich über eine Umgebungsvariable festlegen, zum Beispiel
-`FEDORA_UPDATE_TPM_PCRS=7+14 fedora-update --tpm-check`. TPM-Bindungen mit PIN
-werden erkannt, aber nicht automatisch getestet.
+`FEDORA_UPDATE_TPM_PCRS=7+14 fedora-update --tpm-check`.
+
+**TPM mit PIN:** Ist die Bindung zusätzlich mit einer PIN geschützt
+(`--tpm2-with-pin=yes`), lässt sie sich nur mit PIN testen. Im normalen
+Update-Lauf wird darum nicht jedes Mal nach der PIN gefragt. Mit
+`fedora-update --tpm-check` testet das Script die Entsperrung interaktiv; bei
+einer Neuanmeldung wird die PIN-Pflicht beibehalten und die PIN neu gesetzt.
 
 Einen Recovery-Key legst du bei Bedarf so an und bewahrst ihn sicher auf:
 

@@ -27,7 +27,7 @@ set -uo pipefail
 
 # ---------------------------------------------------------------- Konstanten
 
-readonly VERSION="1.1.0"
+readonly VERSION="1.1.1"
 readonly LOGDIR="${XDG_STATE_HOME:-$HOME/.local/state}/fedora-update"
 LOGFILE="${LOGDIR}/$(date +%Y-%m-%d_%H%M%S).log"
 readonly LOGFILE
@@ -136,6 +136,14 @@ tpm_unlock_ok() {
 		--token-type systemd-tpm2 "$1" </dev/null >/dev/null 2>&1
 }
 
+# Wie tpm_unlock_ok, aber für TPM-Bindungen mit PIN: cryptsetup fragt die
+# PIN selbst am Terminal ab.
+tpm_unlock_ok_pin() {
+	# shellcheck disable=SC2024
+	sudo cryptsetup open --test-passphrase --token-only \
+		--token-type systemd-tpm2 "$1" </dev/tty
+}
+
 # Gibt es neben dem TPM noch eine Passphrase oder einen Recovery-Key?
 tpm_has_fallback() {
 	local slots
@@ -144,15 +152,45 @@ tpm_has_fallback() {
 }
 
 # Legt die TPM-Bindung gegen die aktuellen PCR-Werte neu an. Der alte
-# TPM-Slot wird erst nach erfolgreicher Neuanmeldung entfernt.
+# TPM-Slot wird erst nach erfolgreicher Neuanmeldung entfernt. War die alte
+# Bindung mit PIN geschützt, wird auch die neue wieder mit PIN angelegt.
 tpm_reenroll() {
-	local dev="$1"
-	log "\$ sudo systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrs=$TPM_PCRS $dev"
-	info "Bitte Passphrase oder Wiederherstellungsschlüssel für $dev eingeben:"
+	local dev="$1" with_pin="$2"
+	local -a args=(--wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrs="$TPM_PCRS")
+	(( with_pin )) && args+=(--tpm2-with-pin=yes)
+	log "\$ sudo systemd-cryptenroll ${args[*]} $dev"
+	info "Zuerst die LUKS-Passphrase oder den Wiederherstellungsschlüssel für $dev eingeben."
+	(( with_pin )) && info "Danach die TPM-PIN festlegen (du kannst die bisherige wieder verwenden)."
 	# Die Eingabe soll bewusst vom Terminal kommen, nicht an sudo vorbei.
 	# shellcheck disable=SC2024
-	sudo systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto \
-		--tpm2-pcrs="$TPM_PCRS" "$dev" </dev/tty
+	sudo systemd-cryptenroll "${args[@]}" "$dev" </dev/tty
+}
+
+# Bietet die Neuanmeldung an und prüft danach, ob sie funktioniert.
+tpm_offer_reenroll() {
+	local dev="$1" with_pin="$2"
+	if (( DRY_RUN )); then
+		info "[dry-run] sudo systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrs=$TPM_PCRS $dev"
+		return 1
+	fi
+	if ! ask "TPM-Bindung für $dev jetzt neu einrichten (PCR $TPM_PCRS)?"; then
+		info "Ausgelassen – beim Start wird weiterhin die Passphrase verlangt"
+		return 1
+	fi
+	if ! tpm_reenroll "$dev" "$with_pin"; then
+		fail "$dev: Neuanmeldung am TPM fehlgeschlagen"
+		return 1
+	fi
+	if (( with_pin )); then
+		ok "$dev: TPM-Bindung mit PIN neu eingerichtet"
+		return 0
+	fi
+	if tpm_unlock_ok "$dev"; then
+		ok "$dev: TPM-Bindung neu eingerichtet"
+		return 0
+	fi
+	fail "$dev: Neuanmeldung am TPM fehlgeschlagen"
+	return 1
 }
 
 tpm_step() {
@@ -188,38 +226,46 @@ tpm_step() {
 		return 0
 	fi
 
-	local dev failed=0
+	local dev failed=0 unchecked=0
 	for dev in "${TPM_DEVICES[@]}"; do
 		if tpm_uses_pin "$dev"; then
-			info "$dev: TPM mit PIN – automatische Prüfung nicht möglich"
+			# Mit PIN lässt sich die Entsperrung nur interaktiv testen. Im
+			# normalen Update-Lauf wird darum nicht jedes Mal nach der PIN
+			# gefragt, sondern nur mit --tpm-check.
+			if (( ! TPM_ONLY || DRY_RUN || ASSUME_YES )); then
+				info "$dev: TPM mit PIN – Prüfung nur mit «fedora-update --tpm-check»"
+				unchecked=1
+				continue
+			fi
+			if ! ask "TPM-Entsperrung für $dev jetzt mit der TPM-PIN testen?"; then
+				info "$dev: Prüfung ausgelassen"
+				unchecked=1
+				continue
+			fi
+			info "Bitte die TPM-PIN eingeben (nicht die LUKS-Passphrase):"
+			if tpm_unlock_ok_pin "$dev"; then
+				ok "$dev: TPM-Entsperrung mit PIN funktioniert"
+				continue
+			fi
+			warn "$dev: Entsperrung fehlgeschlagen – entweder war die PIN falsch oder die PCR-Werte haben sich geändert (z. B. nach einem Firmware-Update)."
+			info "Bei falscher PIN einfach erneut «fedora-update --tpm-check» ausführen. Zu viele Fehlversuche sperren das TPM vorübergehend."
+			tpm_offer_reenroll "$dev" 1 || failed=1
 			continue
 		fi
+
 		if tpm_unlock_ok "$dev"; then
 			ok "$dev: TPM-Entsperrung funktioniert"
 			continue
 		fi
 
 		warn "$dev: Das TPM gibt den Schlüssel nicht mehr frei (PCR-Werte geändert, z. B. nach einem Firmware-Update)."
-		if (( DRY_RUN )); then
-			info "[dry-run] sudo systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrs=$TPM_PCRS $dev"
-			failed=1
-			continue
-		fi
-		if ask "TPM-Bindung für $dev jetzt neu einrichten (PCR $TPM_PCRS)?"; then
-			if tpm_reenroll "$dev" && tpm_unlock_ok "$dev"; then
-				ok "$dev: TPM-Bindung neu eingerichtet"
-			else
-				fail "$dev: Neuanmeldung am TPM fehlgeschlagen"
-				failed=1
-			fi
-		else
-			info "Ausgelassen – beim Start wird weiterhin die Passphrase verlangt"
-			failed=1
-		fi
+		tpm_offer_reenroll "$dev" 0 || failed=1
 	done
 
 	if (( failed )); then
 		RESULTS+=("tpm: Neuanmeldung ausstehend (fedora-update --tpm-check)")
+	elif (( unchecked )); then
+		RESULTS+=("tpm: nicht geprüft (PIN) – bei Bedarf «fedora-update --tpm-check»")
 	else
 		RESULTS+=("tpm: OK")
 	fi
