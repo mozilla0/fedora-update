@@ -17,7 +17,7 @@ set -uo pipefail
 
 # ---------------------------------------------------------------- Konstanten
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.0.1"
 readonly LOGDIR="${XDG_STATE_HOME:-$HOME/.local/state}/fedora-update"
 LOGFILE="${LOGDIR}/$(date +%Y-%m-%d_%H%M%S).log"
 readonly LOGFILE
@@ -74,7 +74,9 @@ ask() {
 	(( ASSUME_YES )) && return 0
 	(( DRY_RUN )) && return 1
 	local answer
-	read -r -p "$(printf '%s?%s %s [j/N] ' "$C_YELLOW" "$C_RESET" "$prompt")" answer
+	# Explizit vom Terminal lesen, damit die Abfrage auch funktioniert,
+	# wenn stdin umgeleitet ist. Ohne Terminal gilt die Antwort als Nein.
+	read -r -p "$(printf '%s?%s %s [j/N] ' "$C_YELLOW" "$C_RESET" "$prompt")" answer </dev/tty 2>/dev/null || return 1
 	[[ "$answer" =~ ^([jJ]|[yY])$ ]]
 }
 
@@ -165,23 +167,44 @@ fi
 section "2/4  Flatpak-Anwendungen"
 
 if command -v flatpak >/dev/null 2>&1; then
-	fp_args=(update)
-	(( ASSUME_YES )) && fp_args+=(-y)
-	if run flatpak "${fp_args[@]}"; then
-		ok "Flatpaks aktualisiert"
-		RESULTS+=("flatpak: OK")
+	# flatpak darf hier nie selbst nachfragen: Durch die Ausgabe über tee
+	# sieht es kein Terminal, wertet seine [Y/n]-Abfrage als «n» und bricht
+	# mit Fehler ab. Darum zuerst selbst prüfen und bestätigen lassen, danach
+	# nicht-interaktiv aktualisieren.
+	info "Suche nach Aktualisierungen …"
+	fp_updates=$(flatpak remote-ls --updates --columns=application,branch,origin 2>/dev/null)
+
+	if [[ -z "$fp_updates" ]]; then
+		ok "Alle Flatpaks sind aktuell"
+		RESULTS+=("flatpak: aktuell")
 	else
-		fail "flatpak update mit Fehler beendet"
-		RESULTS+=("flatpak: FEHLER")
+		fp_count=$(grep -c . <<<"$fp_updates")
+		printf '\n'
+		printf '%s\n' "$fp_updates" | column -t 2>/dev/null || printf '%s\n' "$fp_updates"
+		printf '\n'
+		log "$fp_updates"
+
+		if (( DRY_RUN )) || ask "${fp_count} Flatpak-Aktualisierung(en) installieren?"; then
+			if run flatpak update -y --noninteractive; then
+				ok "Flatpaks aktualisiert"
+				RESULTS+=("flatpak: OK")
+			else
+				fail "flatpak update mit Fehler beendet"
+				RESULTS+=("flatpak: FEHLER")
+			fi
+		else
+			info "Flatpak-Update ausgelassen"
+			RESULTS+=("flatpak: verfügbar, nicht installiert")
+		fi
 	fi
 
 	# Nicht mehr benötigte Runtimes entfernen – die sammeln sich sonst an
 	# und belegen schnell mehrere Gigabyte.
 	if (( ASSUME_YES )); then
-		run flatpak uninstall --unused -y >/dev/null && info "Ungenutzte Runtimes entfernt"
+		run flatpak uninstall --unused -y --noninteractive >/dev/null && info "Ungenutzte Runtimes entfernt"
 	else
 		if ask "Ungenutzte Flatpak-Runtimes entfernen?"; then
-			run flatpak uninstall --unused -y
+			run flatpak uninstall --unused -y --noninteractive
 		fi
 	fi
 else
